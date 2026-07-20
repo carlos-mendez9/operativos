@@ -93,10 +93,13 @@ WordPress, Apache, HAProxy, Redis y MariaDB terminan usando llamadas al sistema 
 
 **eBPF** permite ejecutar programas verificados dentro del kernel para observar eventos del sistema. Puede engancharse a tracepoints, kprobes, uprobes, eventos de red, eventos de planificación y otros puntos de instrumentación.
 
-En este laboratorio se usará principalmente:
+En este laboratorio sobre **Ubuntu 24.04 en WSL2** se usará principalmente:
 
 - `bpftrace`: herramienta de alto nivel para escribir trazas cortas.
-- BCC tools: herramientas listas como `execsnoop`, `tcpconnect`, `tcplife`, `biolatency` y `runqlat`.
+- `strace`: herramienta clásica para comparar la observación de un proceso específico contra la observación global del kernel.
+- herramientas tradicionales como `ss`, `ps`, `lsns`, `docker stats` y `curl` para complementar las trazas.
+
+No se usarán herramientas BCC con sufijo `-bpfcc`, tales como `execsnoop-bpfcc`, `tcpconnect-bpfcc`, `tcplife-bpfcc`, `biolatency-bpfcc` o `runqlat-bpfcc`. En WSL2 suelen fallar porque intentan compilar programas BPF usando headers del kernel `microsoft-standard-WSL2`, que normalmente no están disponibles dentro de Ubuntu.
 
 ### 3.4 Tracepoint, kprobe y comm
 
@@ -145,10 +148,7 @@ sudo apt update
 
 sudo apt install -y \
   bpftrace \
-  bpfcc-tools \
-  bpftool \
   linux-tools-common \
-  linux-perf \
   curl \
   jq \
   iproute2 \
@@ -156,6 +156,10 @@ sudo apt install -y \
   sysstat \
   strace
 ```
+
+Nota para WSL2: no instalar directamente `bpftool`, `linux-perf` ni `bpfcc-tools` para este laboratorio. Los paquetes `bpftool` y `linux-perf` pueden no estar disponibles con esos nombres en Ubuntu 24.04 sobre WSL2, y las herramientas BCC `*-bpfcc` pueden fallar por ausencia de headers del kernel `microsoft-standard-WSL2`.
+
+La práctica queda diseñada para usar **`bpftrace` con tracepoints**, que es suficiente para observar procesos, llamadas al sistema, red, archivos, actividad de bloque y planificación.
 
 ### 5.3 Validar soporte básico de eBPF
 
@@ -291,8 +295,8 @@ sudo bpftrace -e '
 tracepoint:sched:sched_process_fork
 {
   printf("FORK parent=%s(%d) child=%s(%d)\n",
-    str(args->parent_comm), args->parent_pid,
-    str(args->child_comm), args->child_pid);
+    args->parent_comm, args->parent_pid,
+    args->child_comm, args->child_pid);
 }
 
 tracepoint:sched:sched_process_exec
@@ -314,25 +318,29 @@ docker compose exec mariadb mariadb -uusuario -ppassword mi_base_de_datos -e 'SE
 
 Detener la traza con `Ctrl+C`.
 
-### 8.2 Usando BCC
+### 8.2 Usando bpftrace
 
 En una terminal:
 
 ```bash
-sudo execsnoop-bpfcc
-```
-
-Si el comando no existe, buscar el nombre instalado:
-
-```bash
-command -v execsnoop-bpfcc || ls /usr/sbin/*execsnoop* /usr/share/bcc/tools/execsnoop 2>/dev/null
+sudo bpftrace -e '
+tracepoint:sched:sched_process_exec
+{
+  printf("EXEC pid=%d comm=%s file=%s\n",
+    pid, comm, str(args->filename));
+}
+'
 ```
 
 En otra terminal:
 
 ```bash
-docker compose exec web2 bash -lc 'id && whoami && php -m | head'
+for i in {1..20}; do
+  curl -s -o /dev/null http://localhost:803/wp-login.php
+done
 ```
+
+
 
 ### Análisis esperado
 
@@ -443,30 +451,69 @@ Explicar qué archivos intenta abrir Apache/PHP al procesar una solicitud. Relac
 
 ## 11. Práctica 5: comparar strace y eBPF
 
-### 11.1 strace sobre HAProxy
+### 11.1 `strace` sobre HAProxy
 
-Obtener PID de HAProxy:
+HAProxy puede ejecutarse en modo **master-worker**. En ese modo, el PID que Docker reporta puede corresponder al proceso maestro, mientras que las conexiones HTTP son atendidas por un worker hijo. Por eso, adjuntarse únicamente al PID principal puede no mostrar actividad aunque lleguen solicitudes.
+
+Obtener el PID principal del contenedor:
 
 ```bash
-HAPROXY_PID=$(docker inspect -f '{{.State.Pid}}' wordpress-ha-lab-haproxy-1)
-echo "$HAPROXY_PID"
+HAPROXY_MASTER=$(docker inspect -f '{{.State.Pid}}' wordpress-ha-lab-haproxy-1)
+echo "PID principal de HAProxy: $HAPROXY_MASTER"
 ```
 
-Adjuntar `strace`:
+Ver los procesos HAProxy en el host WSL:
 
 ```bash
-sudo strace -p "$HAPROXY_PID" -f -e trace=network
+ps -eo pid,ppid,user,comm,args | grep '[h]aproxy'
 ```
 
-En otra terminal:
+Ver posibles workers hijos:
 
 ```bash
-curl -s -o /dev/null http://localhost:803/wp-login.php
+pgrep -P "$HAPROXY_MASTER" -a
+```
+
+Construir la lista de PIDs del maestro y sus workers:
+
+```bash
+HAPROXY_PIDS=$(
+  {
+    echo "$HAPROXY_MASTER"
+    pgrep -P "$HAPROXY_MASTER" || true
+  } | sort -n | uniq
+)
+
+echo "$HAPROXY_PIDS"
+```
+
+Adjuntar `strace` a todos esos procesos:
+
+```bash
+sudo strace -ff -tt -s 128 \
+  -e trace=network,read,write,epoll_wait,epoll_pwait,epoll_ctl \
+  $(printf -- '-p %s ' $HAPROXY_PIDS)
+```
+
+En otra terminal generar tráfico:
+
+```bash
+curl -v -H 'Connection: close' http://localhost:803/wp-login.php -o /dev/null
 ```
 
 Detener `strace` con `Ctrl+C`.
 
+### Análisis esperado de `strace`
+
+Responder:
+
+1. ¿Cuál proceso muestra más actividad: el maestro o el worker?
+2. ¿Por qué `epoll_wait()` aparece en servidores de red como HAProxy?
+3. ¿Qué diferencia hay entre adjuntarse a un PID específico y observar eventos globales del kernel?
+
 ### 11.2 eBPF para observar eventos de red globales
+
+En una terminal:
 
 ```bash
 sudo bpftrace -e '
@@ -486,13 +533,15 @@ interval:s:5
 '
 ```
 
-Generar tráfico:
+En otra terminal generar tráfico:
 
 ```bash
 for i in {1..50}; do
-  curl -s -o /dev/null http://localhost:803/wp-login.php
- done
+  curl -s -H 'Connection: close' -o /dev/null http://localhost:803/wp-login.php
+done
 ```
+
+Detener con `Ctrl+C`.
 
 ### Análisis esperado
 
@@ -500,48 +549,117 @@ Comparar:
 
 | Herramienta | Alcance | Ventaja | Limitación |
 |---|---|---|---|
-| `strace` | Un proceso o árbol de procesos | Fácil de interpretar | Puede generar mucho overhead |
-| `bpftrace` | Eventos globales del kernel con filtros | Observabilidad amplia | Requiere privilegios y conocimiento del kernel |
+| `strace` | Un proceso o árbol de procesos | Fácil de interpretar | Puede no mostrar nada si se adjunta al proceso equivocado; puede generar overhead |
+| `bpftrace` | Eventos globales del kernel con filtros | Observabilidad amplia | Requiere privilegios y conocimiento de eventos del kernel |
+
+Idea central:
+
+```text
+strace observa procesos concretos.
+eBPF observa eventos del kernel y permite filtrar después por proceso, syscall o nombre de comando.
+```
 
 ---
 
 ## 12. Práctica 6: observar conexiones TCP
 
-### 12.1 Usando BCC tcpconnect
+En WSL2 no se usarán `tcpconnect-bpfcc` ni `tcplife-bpfcc`. Para observar conexiones se usará `bpftrace` sobre llamadas al sistema y `ss` como herramienta tradicional de comparación.
+
+### 12.1 Observar intentos de conexión con `bpftrace`
 
 En una terminal:
 
 ```bash
-sudo tcpconnect-bpfcc
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_connect
+{
+  printf("CONNECT pid=%d comm=%s fd=%d\n", pid, comm, args->fd);
+}
+'
 ```
 
 En otra terminal:
 
 ```bash
 for i in {1..20}; do
-  curl -s -o /dev/null http://localhost:803/wp-login.php
- done
+  curl -s -H 'Connection: close' -o /dev/null http://localhost:803/wp-login.php
+done
 ```
 
 Detener con `Ctrl+C`.
 
-### 12.2 Usando BCC tcplife
+Nota: esta traza muestra qué procesos invocan `connect()`. No necesariamente muestra IP y puerto. Para el objetivo del laboratorio, basta para evidenciar que las conexiones TCP son eventos observables desde el kernel.
+
+### 12.2 Contar conexiones por proceso
 
 En una terminal:
 
 ```bash
-sudo tcplife-bpfcc
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_connect
+{
+  @[comm] = count();
+}
+
+interval:s:5
+{
+  print(@);
+  clear(@);
+}
+'
+```
+
+En otra terminal:
+
+```bash
+for i in {1..50}; do
+  curl -s -H 'Connection: close' -o /dev/null http://localhost:803/wp-login.php
+done
+```
+
+### 12.3 Filtrar solo HAProxy
+
+En una terminal:
+
+```bash
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_connect
+/comm == "haproxy"/
+{
+  printf("HAProxy abre conexión: pid=%d fd=%d\n", pid, args->fd);
+}
+'
 ```
 
 En otra terminal:
 
 ```bash
 for i in {1..20}; do
-  curl -s -o /dev/null http://localhost:803/wp-login.php
- done
+  curl -s -H 'Connection: close' -o /dev/null http://localhost:803/wp-login.php
+done
 ```
 
-### 12.3 Revisar red Docker
+Si no aparecen muchos eventos, puede ser porque HAProxy reutiliza conexiones hacia los backends. Para forzar más actividad se puede reiniciar HAProxy:
+
+```bash
+docker compose restart haproxy
+```
+
+### 12.4 Revisar sockets con `ss`
+
+Mientras se genera tráfico, en otra terminal:
+
+```bash
+ss -tnp | grep -E '803|:80|haproxy' || true
+```
+
+O bien:
+
+```bash
+watch -n 1 "ss -tnp | grep -E '803|:80|haproxy' || true"
+```
+
+### 12.5 Revisar red Docker
 
 ```bash
 docker network ls
@@ -559,9 +677,10 @@ curl -> localhost:803 -> Docker port publishing -> HAProxy -> web1/web2 -> Redis
 
 Responder:
 
-1. ¿Qué conexiones TCP se observan?
+1. ¿Qué procesos invocan `connect()`?
 2. ¿Por qué algunas conexiones parecen locales?
 3. ¿Qué diferencia hay entre una conexión cliente-HAProxy y una conexión HAProxy-backend?
+4. ¿Qué aporta `bpftrace` y qué aporta `ss`?
 
 ---
 
@@ -608,15 +727,26 @@ docker compose exec redis redis-cli -n 1 DBSIZE
 En una terminal:
 
 ```bash
-sudo tcpconnect-bpfcc
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_connect
+{
+  @[comm] = count();
+}
+
+interval:s:5
+{
+  print(@);
+  clear(@);
+}
+'
 ```
 
 En otra terminal:
 
 ```bash
-for i in {1..20}; do
-  curl -s -c /tmp/ebpf-cookies.txt -b /tmp/ebpf-cookies.txt http://localhost:803/ebpf-session-test.php >/dev/null
- done
+for i in {1..50}; do
+  curl -s -H 'Connection: close' -o /dev/null http://localhost:803/wp-login.php
+done
 ```
 
 ### 13.5 Limpiar archivo de prueba
@@ -636,7 +766,7 @@ Responder:
 
 ---
 
-## 14. Práctica 8: observar latencia de disco
+## 14. Práctica 8: observar actividad de disco
 
 En este laboratorio hay I/O persistente en:
 
@@ -644,12 +774,33 @@ En este laboratorio hay I/O persistente en:
 - `redis_data`, usado por Redis con AOF y snapshots.
 - `/home/orh`, montado como `/var/www/html` en los contenedores WordPress.
 
-### 14.1 Observar latencia de bloque con BCC
+En WSL2 no se usará `biolatency-bpfcc`. En su lugar se usarán tracepoints de bloque con `bpftrace`. La disponibilidad exacta de campos puede variar según el kernel, por eso primero se validan los tracepoints.
+
+### 14.1 Validar tracepoints de bloque disponibles
+
+```bash
+sudo bpftrace -l 'tracepoint:block:*' | head
+sudo bpftrace -lv 'tracepoint:block:block_rq_issue' | head -n 40
+sudo bpftrace -lv 'tracepoint:block:block_rq_complete' | head -n 40
+```
+
+### 14.2 Contar actividad de bloque por proceso
 
 En una terminal:
 
 ```bash
-sudo biolatency-bpfcc 1
+sudo bpftrace -e '
+tracepoint:block:block_rq_issue
+{
+  @[comm] = count();
+}
+
+interval:s:5
+{
+  print(@);
+  clear(@);
+}
+'
 ```
 
 En otra terminal provocar escritura en WordPress:
@@ -658,7 +809,7 @@ En otra terminal provocar escritura en WordPress:
 docker compose exec -u www-data web1 sh -lc '
 for i in $(seq 1 1000); do
   echo "linea $i $(date +%s%N)" >> /var/www/html/ebpf-lab-write.txt
- done
+done
 sync
 '
 ```
@@ -690,7 +841,37 @@ LIMIT 500;
 "
 ```
 
-### 14.2 Limpiar datos de prueba
+Detener con `Ctrl+C`.
+
+### 14.3 Medir latencia de bloque si los campos están disponibles
+
+Si los tracepoints `block_rq_issue` y `block_rq_complete` exponen `dev` y `sector`, usar:
+
+```bash
+sudo bpftrace -e '
+tracepoint:block:block_rq_issue
+{
+  @start[args->dev, args->sector] = nsecs;
+}
+
+tracepoint:block:block_rq_complete
+/@start[args->dev, args->sector]/
+{
+  @lat_us = hist((nsecs - @start[args->dev, args->sector]) / 1000);
+  delete(@start[args->dev, args->sector]);
+}
+
+interval:s:5
+{
+  print(@lat_us);
+  clear(@lat_us);
+}
+'
+```
+
+Si esta traza falla, usar solamente la traza de conteo de actividad de bloque de la sección 14.2.
+
+### 14.4 Limpiar datos de prueba
 
 ```bash
 docker compose exec -u www-data web1 rm -f /var/www/html/ebpf-lab-write.txt
@@ -705,35 +886,19 @@ docker compose exec redis redis-cli DEL ebpf:lab
 Responder:
 
 1. ¿Cuál operación produjo más actividad de bloque?
-2. ¿La latencia de disco observada corresponde únicamente al contenedor?
+2. ¿La actividad de disco observada corresponde únicamente al contenedor?
 3. En WSL2, ¿qué capas adicionales podrían influir en la latencia?
+4. ¿Por qué una escritura dentro del contenedor termina observándose como actividad del kernel compartido?
 
 ---
 
 ## 15. Práctica 9: observar planificación de CPU
 
-### 15.1 Observar latencia de cola de ejecución
+En WSL2 no se usará `runqlat-bpfcc`. Para observar planificación se usará el tracepoint `sched:sched_switch`, que permite ver cambios de contexto. El objetivo es mostrar que el planificador del kernel agenda procesos e hilos, no “contenedores” como entidad mágica.
+
+### 15.1 Observar cambios de contexto
 
 En una terminal:
-
-```bash
-sudo runqlat-bpfcc 1
-```
-
-En otra terminal generar carga CPU dentro de `web1`:
-
-```bash
-docker compose exec web1 bash -lc '
-php -r "
-\$t = time() + 10;
-while (time() < \$t) {
-  hash(\"sha256\", random_bytes(1024));
-}
-"
-'
-```
-
-### 15.2 Observar cambios de contexto
 
 ```bash
 sudo bpftrace -e '
@@ -750,7 +915,20 @@ interval:s:5
 '
 ```
 
-Generar nuevamente carga CPU:
+En otra terminal generar carga CPU dentro de `web1`:
+
+```bash
+docker compose exec web1 bash -lc '
+php -r "
+\$t = time() + 10;
+while (time() < \$t) {
+  hash(\"sha256\", random_bytes(1024));
+}
+"
+'
+```
+
+Repetir con `web2`:
 
 ```bash
 docker compose exec web2 bash -lc '
@@ -763,13 +941,28 @@ while (time() < \$t) {
 '
 ```
 
+### 15.2 Comparar con métricas tradicionales
+
+En otra terminal:
+
+```bash
+docker stats --no-stream
+```
+
+También se puede observar carga general:
+
+```bash
+vmstat 1 5
+```
+
 ### Análisis esperado
 
 Responder:
 
 1. ¿El planificador agenda contenedores o procesos/hilos?
-2. ¿Qué significa una mayor latencia en la cola de ejecución?
-3. ¿Cómo se relaciona esto con CPU-bound, I/O-bound y tiempo de respuesta?
+2. ¿Qué procesos aparecen con mayor cantidad de cambios de contexto?
+3. ¿Cómo se relaciona esto con cargas CPU-bound, I/O-bound y tiempo de respuesta?
+4. ¿Por qué `docker stats` y `bpftrace` muestran perspectivas distintas del mismo fenómeno?
 
 ---
 
@@ -850,10 +1043,32 @@ Instalar herramientas:
 
 ```bash
 sudo apt update
-sudo apt install -y bpftrace bpfcc-tools bpftool
+sudo apt install -y bpftrace linux-tools-common curl jq iproute2 procps sysstat strace
 ```
 
-### 18.2 `tracepoint not found`
+### 18.2 Error con `bpftool` o `linux-perf`
+
+En Ubuntu 24.04 sobre WSL2, `bpftool` puede aparecer como paquete virtual y `linux-perf` puede no estar disponible con ese nombre. Para este laboratorio no son necesarios.
+
+### 18.3 Error con herramientas `*-bpfcc`
+
+Si se ejecuta algo como:
+
+```bash
+sudo tcpconnect-bpfcc
+```
+
+y aparece un error similar a:
+
+```text
+Module kheaders not found
+Unable to find kernel headers
+/lib/modules/5.15.x-microsoft-standard-WSL2/build: No such file or directory
+```
+
+no es un error del estudiante. Es una limitación práctica de BCC en WSL2. Para este laboratorio se deben usar los comandos `bpftrace` indicados en la guía.
+
+### 18.4 `tracepoint not found`
 
 Listar eventos disponibles:
 
@@ -863,7 +1078,7 @@ sudo bpftrace -l 'tracepoint:*' | head
 
 No todos los kernels exponen exactamente los mismos eventos.
 
-### 18.3 Error de permisos
+### 18.5 Error de permisos
 
 Usar `sudo`:
 
@@ -871,20 +1086,23 @@ Usar `sudo`:
 sudo bpftrace --info
 ```
 
-### 18.4 Herramientas BCC con nombres diferentes
+### 18.6 `strace` se queda sin mostrar actividad
 
-Buscar herramientas instaladas:
+Puede estar adjuntado al proceso maestro de HAProxy y no al worker. Revisar:
 
 ```bash
-ls /usr/sbin/*bpfcc | head
-ls /usr/share/bcc/tools 2>/dev/null | head
+HAPROXY_MASTER=$(docker inspect -f '{{.State.Pid}}' wordpress-ha-lab-haproxy-1)
+ps -eo pid,ppid,user,comm,args | grep '[h]aproxy'
+pgrep -P "$HAPROXY_MASTER" -a
 ```
 
-### 18.5 Redis no muestra claves de sesión
+Luego adjuntarse al maestro y a los workers como se indica en la sección 11.1.
+
+### 18.7 Redis no muestra claves de sesión
 
 WordPress por sí solo no siempre usa sesiones PHP. Por eso este laboratorio crea `ebpf-session-test.php` para forzar `session_start()` y validar Redis explícitamente.
 
-### 18.6 MariaDB rechaza credenciales
+### 18.8 MariaDB rechaza credenciales
 
 Para este laboratorio se usan estas credenciales de prueba:
 
@@ -894,23 +1112,21 @@ Base: mi_base_de_datos
 Usuario aplicación: usuario / password
 ```
 
----
-
 ## 19. Entregable sugerido
 
 Cada estudiante o grupo debe entregar un breve informe con:
 
 1. Captura o salida de `docker compose ps`.
 2. PID real de cada contenedor.
-3. Salida parcial de `execsnoop` o `bpftrace` mostrando creación de procesos.
+3. Salida parcial de `bpftrace` mostrando creación o ejecución de procesos.
 4. Conteo de llamadas al sistema durante tráfico HTTP.
-5. Evidencia de conexiones TCP con `tcpconnect` o `tcplife`.
+5. Evidencia de conexiones TCP con `bpftrace` y, si es posible, comparación con `ss`.
 6. Evidencia de sesiones PHP almacenadas en Redis.
-7. Evidencia de latencia de disco con `biolatency`.
-8. Evidencia de planificación con `runqlat` o `sched_switch`.
+7. Evidencia de actividad de disco con tracepoints de bloque en `bpftrace`.
+8. Evidencia de planificación con `sched_switch` y comparación opcional con `docker stats`.
 9. Respuestas a las preguntas de análisis de cada práctica.
 
----
+No se solicita evidencia con `execsnoop-bpfcc`, `tcpconnect-bpfcc`, `tcplife-bpfcc`, `biolatency-bpfcc` ni `runqlat-bpfcc`, porque esas herramientas pueden fallar en WSL2 por ausencia de headers del kernel.
 
 ## 20. Preguntas finales de reflexión
 
@@ -929,7 +1145,8 @@ Cada estudiante o grupo debe entregar un breve informe con:
 
 - Documentación de bpftrace: https://bpftrace.org/docs/
 - Documentación del verificador eBPF del kernel Linux: https://docs.kernel.org/bpf/verifier.html
-- Proyecto BCC: https://github.com/iovisor/bcc
+- Proyecto BCC: https://github.com/iovisor/bcc  
+  Nota: BCC se menciona solo como referencia para Linux nativo; en este laboratorio WSL2 no se usan herramientas `*-bpfcc`.
 - Documentación de Docker sobre contenedores: https://docs.docker.com/
 - Documentación de HAProxy: https://www.haproxy.org/#docs
 - Documentación de Redis: https://redis.io/docs/latest/
